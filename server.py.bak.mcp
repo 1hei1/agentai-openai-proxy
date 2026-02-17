@@ -1,0 +1,967 @@
+"""OpenAI-compatible proxy server for Agent.AI MCP + Toolify-style function calling."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import logging
+import logging.handlers
+import math
+import os
+import re
+import secrets
+import string
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from main import AgentAIClient, create_shared_http_client
+
+# ── Config ───────────────────────────────────────────────────────────
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
+MCP_TOOL_NAME = os.getenv("MCP_TOOL_NAME", "call_an_llm_copy")
+MODEL_NAME = os.getenv("MODEL_NAME", "agent-ai")
+API_KEY = os.getenv("API_KEY", "sk-agentai-proxy")
+PORT = int(os.getenv("PORT", "9090"))
+
+# ── Logging ──────────────────────────────────────────────────────────
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("agentai.proxy")
+
+log_path = os.path.join(BASE_DIR, "server.log")
+fh = logging.handlers.RotatingFileHandler(log_path, maxBytes=10 * 1024 * 1024, backupCount=3)
+fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+logging.getLogger().addHandler(fh)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+# ── Session Pool ─────────────────────────────────────────────────────
+
+
+class _AccountSession:
+    """One account from accounts.json."""
+    __slots__ = ("name", "client", "in_use", "enabled", "requests", "errors", "last_used")
+
+    def __init__(self, name: str, client: AgentAIClient, enabled: bool = True) -> None:
+        self.name = name
+        self.client = client
+        self.in_use = 0
+        self.enabled = enabled
+        self.requests = 0
+        self.errors = 0
+        self.last_used = 0
+
+
+class SessionPool:
+    """Account pool with shared httpx client."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._sessions: list[_AccountSession] = []
+        self._http: httpx.AsyncClient | None = None
+
+    def _load_accounts(self) -> list[dict]:
+        if not os.path.exists(ACCOUNTS_FILE):
+            logger.warning("accounts.json not found at %s", ACCOUNTS_FILE)
+            return []
+        with open(ACCOUNTS_FILE) as f:
+            return json.load(f)
+
+    def _save_accounts(self) -> None:
+        accounts = []
+        for s in self._sessions:
+            c = s.client
+            accounts.append({
+                "name": s.name,
+                "access_token": c.access_token,
+                "refresh_token": c.refresh_token,
+                "client_id": c.client_id,
+                "agent_mcp_base": c.agent_mcp_base,
+                "expires_at": c.expires_at,
+                "mcp_tool": c.mcp_tool,
+                "enabled": s.enabled,
+            })
+        with open(ACCOUNTS_FILE, "w") as f:
+            json.dump(accounts, f, indent=2, ensure_ascii=False)
+
+    async def init(self) -> None:
+        self._http = create_shared_http_client()
+        accounts = self._load_accounts()
+        for acc in accounts:
+            client = AgentAIClient(
+                access_token=acc.get("access_token", ""),
+                refresh_token=acc.get("refresh_token", ""),
+                client_id=acc.get("client_id", ""),
+                agent_mcp_base=acc.get("agent_mcp_base", ""),
+                expires_at=acc.get("expires_at", 0),
+                mcp_tool=acc.get("mcp_tool", ""),
+                shared_client=self._http,
+            )
+            self._sessions.append(_AccountSession(
+                name=acc.get("name", "unknown"),
+                client=client,
+                enabled=acc.get("enabled", True),
+            ))
+        enabled = [s for s in self._sessions if s.enabled]
+        logger.info("Session pool: %d accounts loaded (%d enabled)", len(self._sessions), len(enabled))
+
+    async def close(self) -> None:
+        if self._http:
+            await self._http.aclose()
+            self._http = None
+
+    async def acquire(self) -> _AccountSession:
+        """Get the least-used enabled session."""
+        async with self._lock:
+            enabled = [s for s in self._sessions if s.enabled]
+            if not enabled:
+                raise RuntimeError("No enabled accounts available")
+            session = min(enabled, key=lambda s: s.in_use)
+            session.in_use += 1
+            return session
+
+    def release(self, session: _AccountSession) -> None:
+        session.in_use = max(0, session.in_use - 1)
+
+    @property
+    def sessions(self) -> list[_AccountSession]:
+        return self._sessions
+
+
+pool = SessionPool()
+
+
+# ── Auth ─────────────────────────────────────────────────────────────
+
+
+def verify_api_key(authorization: str | None) -> None:
+    if not API_KEY:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing API key")
+    if authorization[7:] != API_KEY:
+        raise HTTPException(401, "Invalid API key")
+
+
+# ── Toolify-style helpers (from zai-proxy pattern) ───────────────────
+
+
+def _generate_trigger_signal() -> str:
+    chars = string.ascii_letters + string.digits
+    rand = "".join(secrets.choice(chars) for _ in range(4))
+    return f"<Function_{rand}_Start/>"
+
+
+GLOBAL_TRIGGER_SIGNAL = _generate_trigger_signal()
+
+
+def _extract_text_from_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(str(p.get("text", "")))
+        return " ".join(parts).strip()
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except Exception:
+        return str(content)
+
+
+def _build_tool_call_index(messages: list[dict]) -> dict[str, dict[str, str]]:
+    idx: dict[str, dict[str, str]] = {}
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        tcs = msg.get("tool_calls")
+        if not isinstance(tcs, list):
+            continue
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            tc_id = tc.get("id")
+            fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+            name = str(fn.get("name", ""))
+            args = fn.get("arguments", "{}")
+            if not isinstance(args, str):
+                try:
+                    args = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    args = "{}"
+            if isinstance(tc_id, str) and name:
+                idx[tc_id] = {"name": name, "arguments": args}
+    return idx
+
+
+def _format_tool_result(tool_name: str, tool_arguments: str, result_content: str) -> str:
+    return (
+        "<tool_execution_result>\n"
+        f"<tool_name>{tool_name}</tool_name>\n"
+        f"<tool_arguments>{tool_arguments}</tool_arguments>\n"
+        f"<tool_output>{result_content}</tool_output>\n"
+        "</tool_execution_result>"
+    )
+
+
+def _format_assistant_tool_calls(tool_calls: list[dict], trigger_signal: str) -> str:
+    blocks = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+        name = str(fn.get("name", "")).strip()
+        if not name:
+            continue
+        args = fn.get("arguments", "{}")
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args, ensure_ascii=False)
+            except Exception:
+                args = "{}"
+        blocks.append(
+            "<function_call>\n"
+            f"<name>{name}</name>\n"
+            f"<args_json>{args}</args_json>\n"
+            "</function_call>"
+        )
+    if not blocks:
+        return ""
+    return f"{trigger_signal}\n<function_calls>\n" + "\n".join(blocks) + "\n</function_calls>"
+
+
+def _preprocess_messages(messages: list[dict]) -> list[dict]:
+    """Convert tool messages to XML format, normalize roles."""
+    tool_idx = _build_tool_call_index(messages)
+    out: list[dict] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+
+        if role == "tool":
+            tc_id = msg.get("tool_call_id")
+            content = _extract_text_from_content(msg.get("content", ""))
+            info = tool_idx.get(tc_id, {"name": msg.get("name", "unknown_tool"), "arguments": "{}"})
+            out.append({"role": "user", "content": _format_tool_result(info["name"], info["arguments"], content)})
+            continue
+
+        if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+            xml_calls = _format_assistant_tool_calls(msg["tool_calls"], GLOBAL_TRIGGER_SIGNAL)
+            content = (_extract_text_from_content(msg.get("content", "")) + "\n" + xml_calls).strip()
+            out.append({"role": "assistant", "content": content})
+            continue
+
+        if role == "developer":
+            out.append({**msg, "role": "system"})
+            continue
+
+        out.append(msg)
+
+    return out
+
+
+def _flatten_messages(messages: list[dict]) -> str:
+    """Flatten all messages into a single prompt string for MCP."""
+    parts = []
+    for msg in messages:
+        role = str(msg.get("role", "user")).upper()
+        content = _extract_text_from_content(msg.get("content", ""))
+        parts.append(f"<{role}>{content}</{role}>")
+    return "\n".join(parts)
+
+
+def _generate_function_prompt(tools: list[dict], trigger_signal: str) -> str:
+    tool_lines = []
+    for i, t in enumerate(tools):
+        if not isinstance(t, dict) or t.get("type") != "function":
+            continue
+        fn = t.get("function", {}) if isinstance(t.get("function"), dict) else {}
+        name = str(fn.get("name", "")).strip()
+        if not name:
+            continue
+        desc = str(fn.get("description", "")).strip() or "None"
+        params = fn.get("parameters", {})
+        required = params.get("required", []) if isinstance(params, dict) else []
+        try:
+            params_json = json.dumps(params, ensure_ascii=False)
+        except Exception:
+            params_json = "{}"
+        tool_lines.append(
+            f"{i+1}. <tool name=\"{name}\">\n"
+            f"   Description: {desc}\n"
+            f"   Required: {', '.join(required) if isinstance(required, list) and required else 'None'}\n"
+            f"   Parameters JSON Schema: {params_json}"
+        )
+
+    tools_block = "\n\n".join(tool_lines) if tool_lines else "(no tools)"
+    return (
+        "You have access to tools.\n\n"
+        "When you need to call tools, you MUST output exactly:\n"
+        f"{trigger_signal}\n"
+        "<function_calls>\n"
+        "  <function_call>\n"
+        "    <name>tool_name</name>\n"
+        "    <args_json>{\"arg\":\"value\"}</args_json>\n"
+        "  </function_call>\n"
+        "</function_calls>\n\n"
+        "Rules:\n"
+        "1) args_json MUST be valid JSON object\n"
+        "2) For multiple calls, output one <function_calls> with multiple <function_call> children\n"
+        "3) If no tool is needed, answer normally\n\n"
+        f"Available tools:\n{tools_block}"
+    )
+
+
+def _safe_process_tool_choice(tool_choice: Any, tools: list[dict]) -> str:
+    if tool_choice is None:
+        return ""
+    if isinstance(tool_choice, str):
+        if tool_choice == "required":
+            return "\nIMPORTANT: You MUST call at least one tool in your next response."
+        if tool_choice == "none":
+            return "\nIMPORTANT: Do not call tools. Answer directly."
+        return ""
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function", {}) if isinstance(tool_choice.get("function"), dict) else {}
+        name = fn.get("name")
+        if isinstance(name, str) and name:
+            return f"\nIMPORTANT: You MUST call this tool: {name}"
+    return ""
+
+
+_TRIGGER_PATTERN = re.compile(r"<Function_[A-Za-z0-9]{4}_Start/>")
+
+
+def _find_trigger_pos(text: str) -> int:
+    """Find the last trigger signal position in text."""
+    last = -1
+    for m in _TRIGGER_PATTERN.finditer(text):
+        last = m.start()
+    return last
+
+
+def _parse_function_calls_xml(text: str, trigger_signal: str) -> list[dict]:
+    if not text:
+        return []
+    last_pos = -1
+    m = _TRIGGER_PATTERN.search(text)
+    while m:
+        last_pos = m.start()
+        m = _TRIGGER_PATTERN.search(text, m.end())
+    if last_pos == -1:
+        return []
+    sub = text[last_pos:]
+    m = re.search(r"<function_calls>([\s\S]*?)</function_calls>", sub)
+    if not m:
+        return []
+    chunks = re.findall(r"<function_call>([\s\S]*?)</function_call>", m.group(1))
+    out = []
+    for c in chunks:
+        name_m = re.search(r"<name>([\s\S]*?)</name>", c)
+        args_m = re.search(r"<args_json>([\s\S]*?)</args_json>", c)
+        if not name_m:
+            continue
+        name = name_m.group(1).strip()
+        args_raw = (args_m.group(1).strip() if args_m else "{}")
+        try:
+            parsed = json.loads(args_raw) if args_raw else {}
+            if not isinstance(parsed, dict):
+                parsed = {"value": parsed}
+        except Exception:
+            parsed = {"raw": args_raw}
+        out.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(parsed, ensure_ascii=False)},
+        })
+    return out
+
+
+# ── OpenAI response helpers ──────────────────────────────────────────
+
+
+def _make_id() -> str:
+    return f"chatcmpl-{uuid.uuid4().hex[:29]}"
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, math.ceil(len(text) / 2)) if text else 0
+
+
+def _build_usage(prompt_text: str, completion_text: str) -> dict:
+    p = _estimate_tokens(prompt_text)
+    c = _estimate_tokens(completion_text)
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _openai_chunk(
+    completion_id: str, model: str, *,
+    content: str | None = None, finish_reason: str | None = None,
+) -> dict:
+    delta: dict = {}
+    if content is not None:
+        delta["content"] = content
+    return {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+# ── Lifespan ─────────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await pool.init()
+    yield
+    await pool.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ── Endpoints ────────────────────────────────────────────────────────
+
+
+@app.get("/health")
+async def health():
+    enabled = [s for s in pool.sessions if s.enabled]
+    return {
+        "status": "ok",
+        "accounts": len(pool.sessions),
+        "enabled": len(enabled),
+    }
+
+
+@app.get("/v1/models")
+async def list_models(authorization: str = Header(None)):
+    verify_api_key(authorization)
+    return {
+        "object": "list",
+        "data": [{
+            "id": MODEL_NAME,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "agent-ai",
+        }],
+    }
+
+
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str, authorization: str = Header(None)):
+    verify_api_key(authorization)
+    return {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "agent-ai"}
+
+
+@app.get("/admin/accounts")
+async def admin_list_accounts():
+    accounts = []
+    for s in pool.sessions:
+        accounts.append({
+            "name": s.name,
+            "enabled": s.enabled,
+            "hasToken": bool(s.client.access_token),
+            "requests": getattr(s, "requests", 0),
+            "errors": getattr(s, "errors", 0),
+            "lastUsed": getattr(s, "last_used", 0),
+            "in_use": s.in_use,
+            "agent_mcp_base": s.client.agent_mcp_base,
+            "token_expired": s.client.token_expired(),
+            "expires_at": s.client.expires_at,
+        })
+    return {"total": len(accounts), "accounts": accounts}
+
+
+@app.post("/admin/accounts")
+async def admin_add_account(request: Request):
+    body = await request.json()
+    name = body.get("name", f"account-{int(time.time())}")
+    new_client = AgentAIClient(
+        access_token=body.get("access_token", ""),
+        refresh_token=body.get("refresh_token", ""),
+        client_id=body.get("client_id", ""),
+        agent_mcp_base=body.get("agent_mcp_base", ""),
+        expires_at=body.get("expires_at", 0),
+        shared_client=pool._http,
+    )
+    pool._sessions.append(_AccountSession(name=name, client=new_client, enabled=True))
+    pool._save_accounts()
+    return {"status": "ok", "total": len(pool.sessions)}
+
+
+@app.put("/admin/accounts/{index}")
+async def admin_update_account(index: int, request: Request):
+    if index < 0 or index >= len(pool.sessions):
+        raise HTTPException(404, "Not found")
+    body = await request.json()
+    s = pool.sessions[index]
+    if "enabled" in body:
+        s.enabled = body["enabled"]
+    if "access_token" in body:
+        s.client.access_token = body["access_token"]
+    if "refresh_token" in body:
+        s.client.refresh_token = body["refresh_token"]
+    if "client_id" in body:
+        s.client.client_id = body["client_id"]
+    pool._save_accounts()
+    return {"status": "ok"}
+
+
+@app.delete("/admin/accounts/{index}")
+async def admin_delete_account(index: int):
+    if index < 0 or index >= len(pool.sessions):
+        raise HTTPException(404, "Not found")
+    removed = pool._sessions.pop(index)
+    pool._save_accounts()
+    return {"status": "ok", "removed": removed.name}
+
+
+@app.post("/admin/accounts/{name}/toggle")
+async def admin_toggle_account(name: str):
+    for s in pool.sessions:
+        if s.name == name:
+            s.enabled = not s.enabled
+            pool._save_accounts()
+            return {"name": s.name, "enabled": s.enabled}
+    raise HTTPException(404, f"Account {name} not found")
+
+
+@app.post("/admin/accounts/{name}/refresh")
+async def admin_refresh_account(name: str):
+    for s in pool.sessions:
+        if s.name == name:
+            ok = await s.client.refresh_access_token()
+            if ok:
+                pool._save_accounts()
+            return {"name": s.name, "refreshed": ok, "expires_at": s.client.expires_at}
+    raise HTTPException(404, f"Account {name} not found")
+
+
+# ── OAuth flow ───────────────────────────────────────────────────────
+
+_oauth_sessions: dict[str, dict] = {}
+
+
+@app.post("/admin/oauth/start")
+async def oauth_start(request: Request):
+    body = await request.json()
+    agent_id = body.get("agent_id", "k0uu50s2ddfcjzo9")
+    mcp_base = f"https://api.agent.ai/api/v2/agents/{agent_id}"
+
+    # Register OAuth client
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{mcp_base}/oauth/register",
+            json={
+                "client_name": f"web-{int(time.time())}",
+                "redirect_uris": ["http://localhost:8080/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+    if resp.status_code != 200:
+        return JSONResponse(status_code=500, content={"error": f"Register failed: {resp.text[:200]}"})
+    reg = resp.json()
+    client_id = reg.get("client_id")
+    if not client_id:
+        return JSONResponse(status_code=500, content={"error": "Register failed: no client_id"})
+
+    # PKCE
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+
+    session_id = str(uuid.uuid4())
+    _oauth_sessions[session_id] = {
+        "agent_id": agent_id,
+        "mcp_base": mcp_base,
+        "client_id": client_id,
+        "code_verifier": code_verifier,
+        "created": time.time(),
+    }
+    # Cleanup old sessions (>10 min)
+    for k in list(_oauth_sessions):
+        if time.time() - _oauth_sessions[k]["created"] > 600:
+            del _oauth_sessions[k]
+
+    from urllib.parse import urlencode
+    params = urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": "http://localhost:8080/callback",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "scope": "openid profile email mcp:access",
+    })
+    auth_url = f"{mcp_base}/authorize?{params}"
+
+    return {"session_id": session_id, "auth_url": auth_url, "client_id": client_id}
+
+
+@app.post("/admin/oauth/exchange")
+async def oauth_exchange(request: Request):
+    body = await request.json()
+    sid = body.get("session_id")
+    code = body.get("code")
+    sess = _oauth_sessions.get(sid)
+    if not sess:
+        return JSONResponse(status_code=400, content={"error": "Session expired"})
+
+    from urllib.parse import urlencode
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{sess['mcp_base']}/oauth/token",
+            content=urlencode({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": sess["code_verifier"],
+                "client_id": sess["client_id"],
+                "redirect_uri": "http://localhost:8080/callback",
+            }),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    if resp.status_code != 200:
+        return JSONResponse(status_code=400, content={"error": f"Token exchange failed: {resp.text[:200]}"})
+
+    data = resp.json()
+    if not data.get("access_token"):
+        return JSONResponse(status_code=400, content={"error": f"No access_token: {json.dumps(data)[:200]}"})
+
+    # Add account to pool
+    name = f"oauth-{len(pool.sessions) + 1}"
+    expires_at = time.time() + data.get("expires_in", 86400) - 60
+    new_client = AgentAIClient(
+        access_token=data["access_token"],
+        refresh_token=data.get("refresh_token", ""),
+        client_id=sess["client_id"],
+        agent_mcp_base=sess["mcp_base"],
+        expires_at=expires_at,
+        shared_client=pool._http,
+    )
+    pool._sessions.append(_AccountSession(name=name, client=new_client, enabled=True))
+    pool._save_accounts()
+    _oauth_sessions.pop(sid, None)
+
+    logger.info("OAuth account added: %s (agent=%s)", name, sess["agent_id"])
+    return {"status": "ok", "name": name, "total": len(pool.sessions)}
+
+
+# ── Logs ─────────────────────────────────────────────────────────────
+
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+
+@app.get("/admin/logs")
+async def admin_logs(date: str = "", limit: int = 50):
+    if not date:
+        date = time.strftime("%Y-%m-%d")
+    log_file = os.path.join(LOG_DIR, f"{date}.jsonl")
+    if not os.path.exists(log_file):
+        return {"date": date, "total": 0, "showing": 0, "logs": []}
+    with open(log_file) as f:
+        lines = [l.strip() for l in f if l.strip()]
+    logs = []
+    for l in lines[-limit:]:
+        try:
+            logs.append(json.loads(l))
+        except Exception:
+            pass
+    logs.reverse()
+    return {"date": date, "total": len(lines), "showing": len(logs), "logs": logs}
+
+
+@app.get("/admin/ratelimit")
+async def admin_ratelimit():
+    accounts = []
+    for s in pool.sessions:
+        c = s.client
+        accounts.append({
+            "name": s.name,
+            "enabled": s.enabled,
+            "limit": c.rate_limit,
+            "remaining": c.rate_remaining,
+            "reset": c.rate_reset,
+            "requests": s.requests,
+            "errors": s.errors,
+        })
+    total_remaining = sum(a["remaining"] for a in accounts if a["enabled"])
+    total_limit = sum(a["limit"] for a in accounts if a["enabled"])
+    return {
+        "total_limit": total_limit,
+        "total_remaining": total_remaining,
+        "accounts": accounts,
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    auth = request.headers.get("authorization")
+    verify_api_key(auth)
+
+    body = await request.json()
+    model: str = body.get("model", MODEL_NAME)
+    messages: list[dict] = body.get("messages", [])
+    stream: bool = body.get("stream", False)
+    tools: list[dict] | None = body.get("tools")
+    tool_choice = body.get("tool_choice")
+
+    # Preprocess messages
+    processed = _preprocess_messages(messages)
+
+    # Slim down tool schemas: keep name + truncated description, drop parameters
+    slim_tools = None
+    if tools:
+        slim_tools = []
+        for t in tools:
+            if not isinstance(t, dict) or t.get("type") != "function":
+                continue
+            fn = t.get("function", {})
+            desc = str(fn.get("description", ""))[:80]
+            slim_tools.append({"type": "function", "function": {
+                "name": fn.get("name", ""),
+                "description": desc,
+                "parameters": {"type": "object"},
+            }})
+
+    has_fc = bool(slim_tools)
+    if has_fc:
+        fc_prompt = _generate_function_prompt(slim_tools, GLOBAL_TRIGGER_SIGNAL)
+        fc_prompt += _safe_process_tool_choice(tool_choice, slim_tools)
+        processed.insert(0, {"role": "system", "content": fc_prompt})
+
+    prompt_text = _flatten_messages(processed)
+
+    req_id = f"req_{uuid.uuid4().hex[:10]}"
+    # Debug: log per-message sizes
+    for i, m in enumerate(processed):
+        c = _extract_text_from_content(m.get("content", ""))
+        logger.info("[debug][%s] msg[%d] role=%s len=%d", req_id, i, m.get("role"), len(c))
+    if has_fc:
+        logger.info("[debug][%s] fc_prompt_len=%d", req_id, len(fc_prompt))
+    logger.info("[entry][%s] model=%s stream=%s tools=%d msgs=%d prompt_len=%d",
+                req_id, model, stream, len(tools or []), len(messages), len(prompt_text))
+
+    async def _call_mcp(session: _AccountSession) -> str:
+        """Call the MCP tool and return text response."""
+        session.requests += 1
+        session.last_used = int(time.time() * 1000)
+        tool_name = session.client.mcp_tool or MCP_TOOL_NAME
+        try:
+            return await session.client.call_tool(tool_name, {"user_input": prompt_text})
+        except Exception:
+            session.errors += 1
+            raise
+
+    if stream:
+        async def gen_sse():
+            completion_id = _make_id()
+            session = None
+            MAX_RETRIES = 3
+            attempts = 0
+
+            while True:
+                try:
+                    session = await pool.acquire()
+                    text = await _call_mcp(session)
+
+                    # Role chunk
+                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+
+                    # Empty response retry
+                    if not text.strip() and attempts < MAX_RETRIES:
+                        attempts += 1
+                        logger.warning("[stream][%s] empty response, retry %d/%d...", completion_id, attempts, MAX_RETRIES)
+                        pool.release(session)
+                        session = None
+                        await asyncio.sleep(2 ** attempts)
+                        continue
+
+                    # Parse tool calls if applicable
+                    parsed_tcs = _parse_function_calls_xml(text, GLOBAL_TRIGGER_SIGNAL) if has_fc else []
+
+                    if has_fc:
+                        logger.debug("[stream][%s] raw_answer: %s", completion_id, text[:2000])
+
+                    if parsed_tcs:
+                        logger.info("[stream][%s] parsed_tool_calls=%d", completion_id, len(parsed_tcs))
+                        # Send prefix text before trigger
+                        prefix_pos = _find_trigger_pos(text)
+                        if prefix_pos > 0:
+                            prefix = text[:prefix_pos].rstrip()
+                            if prefix:
+                                for chunk_text in _simulate_stream(prefix):
+                                    yield f"data: {json.dumps(_openai_chunk(completion_id, model, content=chunk_text), ensure_ascii=False)}\n\n"
+
+                        for i, tc in enumerate(parsed_tcs):
+                            tc_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"tool_calls": [{"index": i, **tc}]}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
+
+                        yield f"data: {json.dumps(_openai_chunk(completion_id, model, finish_reason='tool_calls'), ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        pool.release(session)
+                        return
+
+                    # Simulate streaming output
+                    for chunk_text in _simulate_stream(text):
+                        yield f"data: {json.dumps(_openai_chunk(completion_id, model, content=chunk_text), ensure_ascii=False)}\n\n"
+
+                    yield f"data: {json.dumps(_openai_chunk(completion_id, model, finish_reason='stop'), ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    pool.release(session)
+                    return
+
+                except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+                    logger.error("[stream][%s] timeout (attempt %d): %s", completion_id, attempts + 1, e)
+                    if session:
+                        pool.release(session)
+                        session = None
+                    attempts += 1
+                    if attempts >= MAX_RETRIES:
+                        yield f"data: {json.dumps(_openai_chunk(completion_id, model, content='[上游超时，请重试]'), ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps(_openai_chunk(completion_id, model, finish_reason='error'), ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    await asyncio.sleep(2 ** attempts)
+                    continue
+
+                except RuntimeError as e:
+                    err_msg = str(e)
+                    logger.error("[stream][%s] error (attempt %d): %s", completion_id, attempts + 1, err_msg)
+                    if session:
+                        pool.release(session)
+                        session = None
+                    attempts += 1
+                    if attempts < MAX_RETRIES and ("500" in err_msg or "401" in err_msg or "502" in err_msg or "503" in err_msg):
+                        await asyncio.sleep(2 ** attempts)
+                        continue
+                    yield f"data: {json.dumps({'error': {'message': err_msg[:200], 'type': 'server_error'}}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                except Exception as e:
+                    logger.exception("[stream][%s] exception: %s", completion_id, e)
+                    if session:
+                        pool.release(session)
+                        session = None
+                    yield f"data: {json.dumps({'error': {'message': str(e)[:200], 'type': 'server_error'}}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+        return StreamingResponse(
+            gen_sse(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    # Non-streaming
+    completion_id = _make_id()
+    session = None
+    MAX_RETRIES_SYNC = 3
+    for attempt in range(MAX_RETRIES_SYNC):
+        try:
+            session = await pool.acquire()
+            text = await _call_mcp(session)
+
+            if not text.strip() and attempt < MAX_RETRIES_SYNC - 1:
+                logger.warning("[sync][%s] empty response, retry %d/%d...", completion_id, attempt + 1, MAX_RETRIES_SYNC)
+                pool.release(session)
+                session = None
+                await asyncio.sleep(2 ** (attempt + 1))
+                continue
+
+            parsed_tcs = _parse_function_calls_xml(text, GLOBAL_TRIGGER_SIGNAL) if has_fc else []
+            if has_fc:
+                logger.debug("[sync][%s] raw_answer: %s", completion_id, text[:2000])
+
+            if parsed_tcs:
+                prefix_pos = _find_trigger_pos(text)
+                prefix_text = text[:prefix_pos].rstrip() if prefix_pos > 0 else None
+                message = {"role": "assistant", "content": prefix_text, "tool_calls": parsed_tcs}
+                return {
+                    "id": completion_id, "object": "chat.completion", "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
+                    "usage": _build_usage(prompt_text, prefix_text or ""),
+                }
+
+            return {
+                "id": completion_id, "object": "chat.completion", "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": _build_usage(prompt_text, text),
+            }
+
+        except Exception as e:
+            logger.exception("[sync][%s] attempt %d/%d error: %s", completion_id, attempt + 1, MAX_RETRIES_SYNC, e)
+            if session:
+                pool.release(session)
+                session = None
+            if attempt < MAX_RETRIES_SYNC - 1:
+                await asyncio.sleep(2 ** (attempt + 1))
+                continue
+            return JSONResponse(status_code=502, content={"error": {"message": str(e)[:200], "type": "server_error"}})
+        finally:
+            if session:
+                pool.release(session)
+
+    return JSONResponse(status_code=502, content={"error": {"message": "Unexpected error", "type": "server_error"}})
+
+
+def _simulate_stream(text: str, chunk_size: int = 20) -> list[str]:
+    """Split text into chunks to simulate streaming."""
+    if not text:
+        return [""]
+    chunks = []
+    for i in range(0, len(text), chunk_size):
+        chunks.append(text[i:i + chunk_size])
+    return chunks
+
+
+# ── Static files for admin.html ──────────────────────────────────────
+
+admin_html = os.path.join(BASE_DIR, "admin.html")
+if os.path.exists(admin_html):
+    from fastapi.responses import FileResponse
+
+    @app.get("/admin")
+    async def admin_page():
+        return FileResponse(admin_html)
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

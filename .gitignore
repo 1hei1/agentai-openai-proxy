@@ -1,0 +1,22 @@
+# 敏感信息
+accounts.json
+api_keys.json
+*.env
+
+# 日志
+server.log
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份
+*.bak
+*.old
+
+# 系统
+.DS_Store
+Thumbs.db

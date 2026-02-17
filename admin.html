@@ -1,0 +1,281 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent.AI Proxy 管理</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}
+.c{max-width:900px;margin:0 auto;padding:20px}h1{font-size:24px;margin-bottom:4px}.sub{color:#94a3b8;margin-bottom:20px;font-size:13px}
+.card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px;border:1px solid #334155}
+.card h2{font-size:15px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:20px}
+.st{background:#1e293b;border-radius:10px;padding:14px;border:1px solid #334155;text-align:center}
+.st .n{font-size:26px;font-weight:700;color:#38bdf8}.st .l{font-size:11px;color:#94a3b8;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;padding:8px 10px;color:#94a3b8;font-weight:500;border-bottom:1px solid #334155}
+td{padding:8px 10px;border-bottom:1px solid #0f172a}
+.bg{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:500}
+.bg-g{background:#064e3b;color:#34d399}.bg-r{background:#450a0a;color:#f87171}
+.btn{padding:7px 14px;border-radius:8px;border:none;cursor:pointer;font-size:12px;font-weight:500;transition:.2s}
+.btn-p{background:#2563eb;color:#fff}.btn-p:hover{background:#1d4ed8}
+.btn-d{background:#dc2626;color:#fff}.btn-d:hover{background:#b91c1c}
+.btn-o{background:transparent;border:1px solid #475569;color:#cbd5e1}.btn-o:hover{background:#334155}
+.btn-s{padding:4px 10px;font-size:11px}
+.fg{margin-bottom:12px}.fg label{display:block;font-size:12px;color:#94a3b8;margin-bottom:4px}
+.fg input{width:100%;padding:9px 11px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:13px;font-family:monospace}
+.fg input:focus{outline:none;border-color:#2563eb}
+.tabs{display:flex;gap:2px;margin-bottom:16px;background:#0f172a;border-radius:10px;padding:3px}
+.tab{padding:7px 14px;border-radius:8px;cursor:pointer;font-size:12px;color:#94a3b8;border:none;background:none}
+.tab.a{background:#1e293b;color:#e2e8f0}.tab:hover{color:#e2e8f0}
+.H{display:none}.fx{display:flex;gap:8px;align-items:center}.fe{justify-content:flex-end}.mt{margin-top:10px}
+.cb{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:9px 35px 9px 11px;font-family:monospace;font-size:12px;word-break:break-all;cursor:pointer;position:relative}
+.cb:hover{border-color:#2563eb}.cb::after{content:'📋';position:absolute;right:8px;top:8px}
+.tg{color:#34d399}.tr{color:#f87171}
+.toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;border-radius:10px;font-size:13px;z-index:99;animation:fi .3s}
+.toast-s{background:#064e3b;color:#34d399;border:1px solid #065f46}.toast-e{background:#450a0a;color:#f87171;border:1px solid #7f1d1d}
+@keyframes fi{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+pre{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:12px;font-size:12px;overflow-x:auto;margin-top:8px;cursor:pointer;white-space:pre-wrap;word-break:break-all}
+pre:hover{border-color:#2563eb}
+.mode-tag{display:inline-block;padding:3px 10px;border-radius:99px;font-size:11px;font-weight:600;background:#1e3a5f;color:#38bdf8;margin-left:8px}
+</style></head><body>
+<div class="c">
+<h1>🤖 Agent.AI → OpenAI Proxy <span class="mode-tag" id="mode-tag"></span></h1>
+<p class="sub">API Key 轮询 · 工具调用 · OpenAI 兼容</p>
+<div class="stats" id="usage-stats"></div>
+<div class="card" id="usage-card" style="display:none">
+<h2>📊 模型用量分布</h2>
+<div style="overflow-x:auto"><table><thead><tr><th>模型</th><th>请求</th><th>错误</th><th>Prompt Tokens</th><th>Completion Tokens</th><th>Total Tokens</th></tr></thead>
+<tbody id="usage-tb"></tbody></table></div>
+</div>
+<div class="stats" id="stats"></div>
+<!-- 用量统计卡片 -->
+<div class="card" id="usage-card">
+<h2>📊 用量统计 <span style="font-size:11px;color:#64748b;font-weight:400" id="usage-updated"></span>
+<button class="btn btn-s btn-o" onclick="ldUsage()" style="margin-left:auto">🔄</button></h2>
+<div class="stats" id="usage-stats"></div>
+<div style="overflow-x:auto;margin-top:8px">
+<table><thead><tr><th>模型</th><th>请求</th><th>错误</th><th>Prompt</th><th>Completion</th><th>Total</th><th>分布</th></tr></thead>
+<tbody id="usage-tb"></tbody></table>
+</div>
+</div>
+
+<div class="tabs">
+<button class="tab a" onclick="sw('keys',this)">🔑 API Keys</button>
+<button class="tab" onclick="sw('add',this)">➕ 添加 Key</button>
+<button class="tab" onclick="sw('models',this)">🧠 模型列表</button>
+<button class="tab" onclick="sw('cfg',this)">⚙️ 接入配置</button>
+</div>
+
+<!-- Key 列表 -->
+<div id="t-keys" class="card">
+<h2>API Key 列表 <button class="btn btn-s btn-o" onclick="ld()">🔄 刷新</button></h2>
+<div style="overflow-x:auto">
+<table><thead><tr><th>名称</th><th>Key</th><th>状态</th><th>请求</th><th>错误</th><th>操作</th></tr></thead>
+<tbody id="tb"></tbody></table>
+</div>
+</div>
+
+<!-- 添加 Key -->
+<div id="t-add" class="card H">
+<h2>➕ 添加 API Key</h2>
+<p style="color:#94a3b8;font-size:12px;margin-bottom:14px">从 <a href="https://agent.ai/user/integrations#api" target="_blank" style="color:#38bdf8">Agent.AI 集成页面</a> 获取 API Key</p>
+<div class="fg"><label>名称（可选）</label><input id="a-name" placeholder="随便起个名字，如 account-2"></div>
+<div class="fg"><label>API Key <span class="tr">*</span></label><input id="a-key" placeholder="YUG7luaZ..."></div>
+<div class="fx fe mt">
+<button class="btn btn-o" onclick="testKey()">🧪 测试</button>
+<button class="btn btn-p" onclick="addKey()">✅ 添加</button>
+</div>
+<div id="test-result" class="H" style="margin-top:12px;padding:10px;border-radius:8px;font-size:13px"></div>
+</div>
+
+<!-- 模型列表 -->
+<div id="t-models" class="card H">
+<h2>🧠 可用模型</h2>
+<p style="color:#94a3b8;font-size:12px;margin-bottom:14px">这些模型可以在 model 参数中使用</p>
+<div id="model-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px"></div>
+</div>
+
+<!-- 配置 -->
+<div id="t-cfg" class="card H">
+<h2>⚙️ 接入配置</h2>
+<p style="color:#94a3b8;font-size:12px;margin-bottom:14px">填入 Cherry Studio / ChatBox / OpenAI SDK 等</p>
+<div class="fg"><label>API Base URL</label><div class="cb" onclick="cp(this.innerText)" id="c-base"></div></div>
+<div class="fg"><label>API Key</label><div class="cb" onclick="cp(this.innerText)" id="c-key"></div></div>
+<div class="fg"><label>默认模型</label><div class="cb" onclick="cp(this.innerText)" id="c-model"></div></div>
+<h2 style="margin-top:20px">Python</h2>
+<pre onclick="cp(this.innerText)" id="c-python"></pre>
+<h2 style="margin-top:16px">curl</h2>
+<pre onclick="cp(this.innerText)" id="c-curl"></pre>
+</div>
+</div>
+
+<script>
+const B=location.origin;
+
+window.onload=()=>{
+  const base=B+'/v1';
+  document.getElementById('c-base').innerText=base;
+  document.getElementById('c-key').innerText='sk-agentai-proxy';
+  document.getElementById('c-model').innerText='claude-sonnet-4';
+  document.getElementById('c-python').innerText=`from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${base}",\n    api_key="sk-agentai-proxy"\n)\n\nresp = client.chat.completions.create(\n    model="claude-sonnet-4",\n    messages=[{"role": "user", "content": "你好"}]\n)\nprint(resp.choices[0].message.content)`;
+  document.getElementById('c-curl').innerText=`curl ${base}/chat/completions \\\n  -H "Authorization: Bearer sk-agentai-proxy" \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"你好"}]}'`;
+  ld();
+  ldHealth();
+  ldModels();
+  ldUsage();
+  setInterval(ldUsage, 30000);
+};
+
+function sw(n,el){
+  document.querySelectorAll('[id^=t-]').forEach(e=>e.classList.add('H'));
+  document.getElementById('t-'+n).classList.remove('H');
+  document.querySelectorAll('.tab').forEach(e=>e.classList.remove('a'));
+  el.classList.add('a');
+}
+function toast(m,ok=true){const d=document.createElement('div');d.className='toast '+(ok?'toast-s':'toast-e');d.textContent=m;document.body.appendChild(d);setTimeout(()=>d.remove(),3000)}
+function cp(t){navigator.clipboard.writeText(t);toast('已复制!')}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+async function ldHealth(){
+  try{
+    const r=await(await fetch(B+'/health')).json();
+    document.getElementById('mode-tag').innerText=r.mode==='invoke_agent'?'Agent 模式':'LLM 模式';
+  }catch(e){}
+}
+
+async function ld(){
+  try{
+    const r=await(await fetch(B+'/admin/keys')).json();
+    const en=r.keys.filter(k=>k.enabled).length;
+    const rq=r.keys.reduce((s,k)=>s+k.requests,0);
+    const er=r.keys.reduce((s,k)=>s+k.errors,0);
+    document.getElementById('stats').innerHTML=
+      `<div class="st"><div class="n">${r.total}</div><div class="l">API Keys</div></div>`+
+      `<div class="st"><div class="n tg">${en}</div><div class="l">启用</div></div>`+
+      `<div class="st"><div class="n">${rq}</div><div class="l">总请求</div></div>`+
+      `<div class="st"><div class="n ${er?'tr':''}">${er}</div><div class="l">错误</div></div>`;
+    document.getElementById('tb').innerHTML=r.keys.map(k=>
+      `<tr><td><b>${esc(k.name)}</b></td>`+
+      `<td style="font-family:monospace;font-size:11px;color:#94a3b8">${esc(k.key_preview)}</td>`+
+      `<td>${k.enabled?'<span class="bg bg-g">启用</span>':'<span class="bg bg-r">禁用</span>'}</td>`+
+      `<td>${k.requests}</td>`+
+      `<td class="${k.errors?'tr':''}">${k.errors}</td>`+
+      `<td><div class="fx">`+
+      `<button class="btn btn-s btn-o" onclick="tog(${k.index})">${k.enabled?'禁用':'启用'}</button>`+
+      `<button class="btn btn-s btn-d" onclick="del(${k.index})">删除</button>`+
+      `</div></td></tr>`).join('');
+  }catch(e){console.error(e)}
+}
+
+async function tog(i){
+  await fetch(B+'/admin/keys/'+i+'/toggle',{method:'POST'});
+  toast('已切换');ld();
+}
+async function del(i){
+  if(!confirm('确定删除？'))return;
+  await fetch(B+'/admin/keys/'+i,{method:'DELETE'});
+  toast('已删除');ld();
+}
+async function addKey(){
+  const key=document.getElementById('a-key').value.trim();
+  if(!key){toast('请填写 API Key',false);return}
+  const name=document.getElementById('a-name').value.trim()||('key-'+Date.now());
+  const r=await(await fetch(B+'/admin/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,key})})).json();
+  if(r.status==='ok'){toast('✅ 添加成功!');document.getElementById('a-name').value='';document.getElementById('a-key').value='';ld()}
+  else toast('添加失败',false);
+}
+async function testKey(){
+  const key=document.getElementById('a-key').value.trim();
+  if(!key){toast('请填写 API Key',false);return}
+  const el=document.getElementById('test-result');
+  el.classList.remove('H');el.style.background='#1e293b';el.innerText='⏳ 测试中...';
+  try{
+    const r=await fetch('https://api-lr.agent.ai/v1/action/invoke_llm',{
+      method:'POST',headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},
+      body:JSON.stringify({instructions:'Say ok',llm_engine:'gpt4o'})
+    });
+    const d=await r.json();
+    if(d.response && !d.response.startsWith('Error')){
+      el.style.background='#064e3b';el.innerHTML='✅ Key 有效！响应: <b>'+esc(d.response.slice(0,50))+'</b>';
+    } else {
+      el.style.background='#450a0a';el.innerText='❌ Key 无效: '+(d.response||d.error||'未知错误').slice(0,100);
+    }
+  }catch(e){el.style.background='#450a0a';el.innerText='❌ 请求失败: '+e.message}
+}
+
+async function ldUsage(){
+  try{
+    const r=await(await fetch(B+'/admin/usage')).json();
+    const t=r.totals||{};
+    const rq=t.requests||0, er=t.errors||0;
+    const rate=rq?((rq-er)/rq*100).toFixed(1):'—';
+    document.getElementById('usage-stats').innerHTML=
+      `<div class="st"><div class="n">${rq}</div><div class="l">总请求</div></div>`+
+      `<div class="st"><div class="n tg">${rate}%</div><div class="l">成功率</div></div>`+
+      `<div class="st"><div class="n">${fmtNum(t.prompt_tokens||0)}</div><div class="l">Prompt Tokens</div></div>`+
+      `<div class="st"><div class="n">${fmtNum(t.completion_tokens||0)}</div><div class="l">Completion</div></div>`+
+      `<div class="st"><div class="n">${fmtNum(t.total_tokens||0)}</div><div class="l">Total Tokens</div></div>`;
+    // Model breakdown table
+    const bd=r.by_date||r.usage||{};
+    const models={};
+    for(const[d,ms] of Object.entries(bd)){
+      for(const[m,s] of Object.entries(ms)){
+        if(!models[m])models[m]={requests:0,errors:0,prompt_tokens:0,completion_tokens:0,total_tokens:0};
+        for(const k of Object.keys(models[m]))models[m][k]+=s[k]||0;
+      }
+    }
+    const maxReq=Math.max(1,...Object.values(models).map(m=>m.requests));
+    const rows=Object.entries(models).sort((a,b)=>b[1].requests-a[1].requests);
+    document.getElementById('usage-tb').innerHTML=rows.length?rows.map(([m,s])=>{
+      const pct=(s.requests/maxReq*100).toFixed(0);
+      return `<tr><td><b>${esc(m)}</b></td><td>${s.requests}</td><td class="${s.errors?'tr':''}">${s.errors}</td>`+
+        `<td>${fmtNum(s.prompt_tokens)}</td><td>${fmtNum(s.completion_tokens)}</td><td>${fmtNum(s.total_tokens)}</td>`+
+        `<td><div style="background:#334155;border-radius:4px;height:8px;width:100px"><div style="background:#38bdf8;border-radius:4px;height:8px;width:${pct}px"></div></div></td></tr>`;
+    }).join(''):'<tr><td colspan="7" style="text-align:center;color:#64748b">暂无数据（服务重启后开始统计）</td></tr>';
+    document.getElementById('usage-updated').innerText='更新: '+new Date().toLocaleTimeString();
+  }catch(e){console.error(e)}
+}
+function fmtNum(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return n}
+
+async function ldUsage(){
+  try{
+    const today=new Date().toISOString().slice(0,10);
+    const r=await(await fetch(B+'/admin/usage?date='+today)).json();
+    const t=r.totals||{};
+    const rate=t.requests>0?Math.round((t.requests-t.errors)/t.requests*100):100;
+    document.getElementById('usage-stats').innerHTML=
+      `<div class="st"><div class="n">${t.requests||0}</div><div class="l">今日请求</div></div>`+
+      `<div class="st"><div class="n ${rate<90?'tr':'tg'}">${rate}%</div><div class="l">成功率</div></div>`+
+      `<div class="st"><div class="n">${((t.total_tokens||0)/1000).toFixed(1)}k</div><div class="l">总 Tokens</div></div>`+
+      `<div class="st"><div class="n">${((t.prompt_tokens||0)/1000).toFixed(1)}k</div><div class="l">Prompt</div></div>`+
+      `<div class="st"><div class="n">${((t.completion_tokens||0)/1000).toFixed(1)}k</div><div class="l">Completion</div></div>`;
+    const u=r.usage||{};
+    const models=u[today]||{};
+    const entries=Object.entries(models).sort((a,b)=>b[1].requests-a[1].requests);
+    if(entries.length){
+      document.getElementById('usage-card').style.display='';
+      document.getElementById('usage-tb').innerHTML=entries.map(([m,s])=>
+        `<tr><td><b>${esc(m)}</b></td><td>${s.requests}</td><td class="${s.errors?'tr':''}">${s.errors}</td><td>${s.prompt_tokens.toLocaleString()}</td><td>${s.completion_tokens.toLocaleString()}</td><td>${s.total_tokens.toLocaleString()}</td></tr>`).join('');
+    }else{document.getElementById('usage-card').style.display='none'}
+  }catch(e){console.error(e)}
+}
+
+async function ldModels(){
+  try{
+    const r=await(await fetch(B+'/v1/models',{headers:{'Authorization':'Bearer sk-agentai-proxy'}})).json();
+    const groups={'OpenAI':[],'Claude':[],'Google':[],'其他':[]};
+    r.data.forEach(m=>{
+      const id=m.id;
+      if(id.startsWith('gpt')||id.startsWith('o1')||id.startsWith('o3'))groups['OpenAI'].push(id);
+      else if(id.includes('claude'))groups['Claude'].push(id);
+      else if(id.includes('gemini'))groups['Google'].push(id);
+      else groups['其他'].push(id);
+    });
+    let html='';
+    for(const[g,models] of Object.entries(groups)){
+      if(!models.length)continue;
+      models.sort();
+      models.forEach(m=>{
+        html+=`<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 12px;font-family:monospace;font-size:12px;cursor:pointer" onclick="cp('${m}')" title="点击复制">${esc(m)} <span style="color:#64748b;font-size:10px">${g}</span></div>`;
+      });
+    }
+    document.getElementById('model-list').innerHTML=html;
+  }catch(e){console.error(e)}
+}
+</script></body></html>
