@@ -39,6 +39,12 @@ SUMMARY_API_KEY = os.getenv("SUMMARY_API_KEY", "sk-PvUDadEMEH7FPMYd9BNZsS0sJoa6T
 SUMMARY_KEEP_ROUNDS = int(os.getenv("SUMMARY_KEEP_ROUNDS", "3"))
 SUMMARY_CACHE_SIZE = int(os.getenv("SUMMARY_CACHE_SIZE", "200"))
 PROACTIVE_SUMMARY_THRESHOLD = int(os.getenv("PROACTIVE_SUMMARY_THRESHOLD", "256000"))
+# Hard token limit for Agent.AI API (leave headroom for response)
+MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "256000"))
+# BM25 extractive compression
+BM25_EXTRACT_TOP_K = int(os.getenv("BM25_EXTRACT_TOP_K", "10"))
+BM25_RELEVANCE_THRESHOLD = float(os.getenv("BM25_RELEVANCE_THRESHOLD", "0.5"))
+TOOL_TRUNCATE_RELEVANT_BONUS = int(os.getenv("TOOL_TRUNCATE_RELEVANT_BONUS", "2000"))
 
 # ── Summary Cache (LRU) ─────────────────────────────────────────────
 
@@ -237,6 +243,220 @@ def _rebuild_with_summary(system_msgs, summary_text, recent_msgs, tools=None):
     rebuilt.extend(recent_msgs)
     return rebuilt
 
+# ── BM25 Extractive Compression ─────────────────────────────────────
+
+_CJK_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
+_WORD_RE = re.compile(r'[a-zA-Z0-9_]+|[\u4e00-\u9fff\u3400-\u4dbf]')
+
+def _tokenize_simple(text: str) -> list[str]:
+    """Tokenize for BM25: CJK chars split individually, English as words, all lowercased."""
+    return [t.lower() for t in _WORD_RE.findall(text)]
+
+def _group_into_rounds(messages: list[dict]) -> list[list[dict]]:
+    """Group non-system messages into rounds. Each round starts with a user message."""
+    rounds = []
+    current = []
+    for m in messages:
+        if m.get("role") == "user" and current:
+            rounds.append(current)
+            current = []
+        current.append(m)
+    if current:
+        rounds.append(current)
+    return rounds
+
+def _round_to_text(round_msgs: list[dict]) -> str:
+    """Convert a round of messages to plain text for BM25 scoring."""
+    parts = []
+    for m in round_msgs:
+        content = _extract_text(m.get("content", ""))
+        if content:
+            parts.append(content)
+        # Include tool call names/args
+        for tc in (m.get("tool_calls") or []):
+            fn = tc.get("function", {})
+            if fn.get("name"):
+                parts.append(fn["name"])
+            args = fn.get("arguments", "")
+            if isinstance(args, str) and len(args) < 500:
+                parts.append(args)
+    return " ".join(parts)
+
+def _bm25_scores(query_tokens: list[str], docs: list[list[str]], k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """Compute BM25 scores for each document given query tokens."""
+    if not docs or not query_tokens:
+        return [0.0] * len(docs)
+
+    n = len(docs)
+    avg_dl = sum(len(d) for d in docs) / n if n else 1
+
+    # Document frequency
+    df: dict[str, int] = defaultdict(int)
+    for doc in docs:
+        seen = set(doc)
+        for t in seen:
+            df[t] += 1
+
+    # IDF (Robertson-Sparck Jones)
+    idf: dict[str, float] = {}
+    for t in set(query_tokens):
+        d = df.get(t, 0)
+        idf[t] = math.log((n - d + 0.5) / (d + 0.5) + 1.0)
+
+    scores = []
+    for doc in docs:
+        dl = len(doc)
+        tf: dict[str, int] = defaultdict(int)
+        for t in doc:
+            tf[t] += 1
+        score = 0.0
+        for t in query_tokens:
+            if t not in tf:
+                continue
+            freq = tf[t]
+            score += idf.get(t, 0) * (freq * (k1 + 1)) / (freq + k1 * (1 - b + b * dl / avg_dl))
+        scores.append(score)
+    return scores
+
+def _extract_relevant_rounds(
+    old_messages: list[dict],
+    query: str,
+    top_k: int = BM25_EXTRACT_TOP_K,
+    threshold: float = BM25_RELEVANCE_THRESHOLD,
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Split old messages into 4 tiers using BM25 + position weighting.
+    Position weight: U-shaped curve (first/last rounds preserved, middle penalized).
+    
+    Returns (tier1_verbatim, tier2_light_trim, tier3_heavy_trim, tier4_summarize)
+    all in chronological order."""
+    rounds = _group_into_rounds(old_messages)
+    if not rounds:
+        return [], [], [], old_messages
+
+    n = len(rounds)
+    query_tokens = _tokenize_simple(query)
+    doc_tokens = [_tokenize_simple(_round_to_text(r)) for r in rounds]
+    raw_scores = _bm25_scores(query_tokens, doc_tokens)
+
+    # Position weighting: U-shaped curve (Lost in the Middle)
+    # First and last rounds get weight 1.0, middle gets down to 0.5
+    position_weights = []
+    for i in range(n):
+        if n <= 2:
+            w = 1.0
+        else:
+            # Normalized position 0..1 from center (0 = middle, 1 = edge)
+            dist_from_center = abs(i - (n - 1) / 2) / ((n - 1) / 2)
+            # U-curve: minimum 0.5 at center, 1.0 at edges
+            w = 0.5 + 0.5 * dist_from_center
+        position_weights.append(w)
+
+    # Apply position weighting to BM25 scores
+    weighted_scores = [s * w for s, w in zip(raw_scores, position_weights)]
+
+    max_score = max(weighted_scores) if weighted_scores else 0
+    if max_score <= 0:
+        return [], [], [], old_messages
+
+    # Normalize to 0-1
+    norm_scores = [s / max_score for s in weighted_scores]
+
+    # 4-tier classification based on normalized score
+    # Tier 1: >= 0.7  → keep verbatim (high relevance)
+    # Tier 2: >= 0.4  → light trim (moderate relevance, truncate tool results)
+    # Tier 3: >= 0.15 → heavy trim (low relevance, aggressive truncation)
+    # Tier 4: < 0.15  → summarize (irrelevant, send to DeepSeek)
+    tier1, tier2, tier3, tier4 = [], [], [], []
+    tier_counts = [0, 0, 0, 0]
+    for i, round_msgs in enumerate(rounds):
+        score = norm_scores[i]
+        if score >= 0.7 and tier_counts[0] < top_k:
+            tier1.extend(round_msgs)
+            tier_counts[0] += 1
+        elif score >= 0.4:
+            tier2.extend(round_msgs)
+            tier_counts[1] += 1
+        elif score >= 0.15:
+            tier3.extend(round_msgs)
+            tier_counts[2] += 1
+        else:
+            tier4.extend(round_msgs)
+            tier_counts[3] += 1
+
+    logger.info("[bm25] %d rounds → tier1(verbatim)=%d, tier2(light)=%d, tier3(heavy)=%d, tier4(summarize)=%d | pos_weights=[%.2f..%.2f]",
+                n, tier_counts[0], tier_counts[1], tier_counts[2], tier_counts[3],
+                min(position_weights), max(position_weights))
+    return tier1, tier2, tier3, tier4
+
+def _trim_messages(messages: list[dict], mode: str = "light") -> list[dict]:
+    """Progressively trim messages. 
+    light: truncate tool results to 1000 chars, tool_call args to 500
+    heavy: truncate tool results to 200 chars, tool_call args to 100, user/assistant to 500 chars"""
+    if mode == "light":
+        tool_limit, args_limit, text_limit = 1000, 500, None
+    else:  # heavy
+        tool_limit, args_limit, text_limit = 200, 100, 500
+
+    result = []
+    for m in messages:
+        role = m.get("role", "")
+        if role == "tool":
+            content = _extract_text(m.get("content", ""))
+            if len(content) > tool_limit:
+                content = content[:tool_limit] + f"\n... [截断至{tool_limit}字符]"
+            result.append({**m, "content": content})
+        elif role == "assistant" and isinstance(m.get("tool_calls"), list):
+            new_tcs = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", "{}")
+                if isinstance(args, str) and len(args) > args_limit:
+                    args = args[:args_limit] + "..."
+                    tc = {**tc, "function": {**fn, "arguments": args}}
+                new_tcs.append(tc)
+            content = _extract_text(m.get("content", ""))
+            if text_limit and len(content) > text_limit:
+                content = content[:text_limit] + "..."
+            result.append({**m, "content": content, "tool_calls": new_tcs})
+        else:
+            content = _extract_text(m.get("content", ""))
+            if text_limit and content and len(content) > text_limit:
+                content = content[:text_limit] + "..."
+                result.append({**m, "content": content})
+            else:
+                result.append(m)
+    return result
+
+def _get_bm25_relevance_map(messages: list[dict], query: str) -> dict[int, float]:
+    """Get BM25 relevance score (0-1 normalized) for each message index.
+    Used by tool truncation to give bonus space to relevant tool results."""
+    # Only score non-system messages
+    conversation = [(i, m) for i, m in enumerate(messages) if m.get("role") != "system"]
+    if not conversation:
+        return {}
+
+    rounds = []
+    current_round_indices = []
+    for idx, m in conversation:
+        if m.get("role") == "user" and current_round_indices:
+            rounds.append(current_round_indices)
+            current_round_indices = []
+        current_round_indices.append(idx)
+    if current_round_indices:
+        rounds.append(current_round_indices)
+
+    query_tokens = _tokenize_simple(query)
+    doc_tokens = [_tokenize_simple(" ".join(_extract_text(messages[i].get("content", "")) for i in r)) for r in rounds]
+    scores = _bm25_scores(query_tokens, doc_tokens)
+    max_score = max(scores) if scores else 0
+
+    relevance_map = {}
+    for r_idx, indices in enumerate(rounds):
+        norm = scores[r_idx] / max_score if max_score > 0 else 0
+        for i in indices:
+            relevance_map[i] = norm
+    return relevance_map
+
 # ── API Key Pool ─────────────────────────────────────────────────────
 
 class KeyPool:
@@ -362,10 +582,10 @@ TOOL_TRUNCATE_NEAR = int(os.getenv("TOOL_TRUNCATE_NEAR", "500"))    # 3-10 round
 TOOL_TRUNCATE_FAR = int(os.getenv("TOOL_TRUNCATE_FAR", "100"))      # 10+ rounds ago
 
 def _truncate_tool_results(messages: list[dict]) -> list[dict]:
-    """Truncate tool call results based on distance from the end of conversation.
+    """Truncate tool call results based on distance + BM25 relevance.
     - Last 3 rounds: keep full
-    - 3-10 rounds ago: truncate tool results to TOOL_TRUNCATE_NEAR chars
-    - 10+ rounds ago: truncate tool results to TOOL_TRUNCATE_FAR chars
+    - 3-10 rounds ago: truncate to TOOL_TRUNCATE_NEAR (+ bonus if BM25 relevant)
+    - 10+ rounds ago: truncate to TOOL_TRUNCATE_FAR (+ bonus if BM25 relevant)
     """
     # Find round boundaries (each user message starts a new round)
     round_starts = []
@@ -376,6 +596,14 @@ def _truncate_tool_results(messages: list[dict]) -> list[dict]:
     total_rounds = len(round_starts)
     if total_rounds <= 3:
         return messages  # Nothing to truncate
+    
+    # Get BM25 relevance for smarter truncation
+    query = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            query = _extract_text(m.get("content", ""))
+            break
+    relevance_map = _get_bm25_relevance_map(messages, query) if query else {}
     
     # Map each message index to its round number (from the end)
     msg_round_from_end = {}
@@ -391,14 +619,20 @@ def _truncate_tool_results(messages: list[dict]) -> list[dict]:
     for i, m in enumerate(messages):
         rounds_ago = msg_round_from_end.get(i, 0)
         role = m.get("role", "")
+        relevance = relevance_map.get(i, 0)
         
         if role == "tool" and rounds_ago > 3:
             content = _extract_text(m.get("content", ""))
             limit = TOOL_TRUNCATE_NEAR if rounds_ago <= 10 else TOOL_TRUNCATE_FAR
+            # BM25 relevance bonus
+            if relevance > 0.5:
+                limit += TOOL_TRUNCATE_RELEVANT_BONUS
+            elif relevance > 0.2:
+                limit += TOOL_TRUNCATE_RELEVANT_BONUS // 2
             if len(content) > limit:
                 saved_chars += len(content) - limit
                 truncated_count += 1
-                truncated = content[:limit] + f"\n... [截断，原始 {len(content)} 字符]"
+                truncated = content[:limit] + f"\n... [截断，原始 {len(content)} 字符，相关度 {relevance:.2f}]"
                 result.append({**m, "content": truncated})
                 continue
         
@@ -410,6 +644,10 @@ def _truncate_tool_results(messages: list[dict]) -> list[dict]:
                 args = fn.get("arguments", "{}")
                 if isinstance(args, str):
                     limit = TOOL_TRUNCATE_NEAR if rounds_ago <= 10 else TOOL_TRUNCATE_FAR
+                    if relevance > 0.5:
+                        limit += TOOL_TRUNCATE_RELEVANT_BONUS
+                    elif relevance > 0.2:
+                        limit += TOOL_TRUNCATE_RELEVANT_BONUS // 2
                     if len(args) > limit:
                         saved_chars += len(args) - limit
                         args = args[:limit] + "..."
@@ -421,7 +659,8 @@ def _truncate_tool_results(messages: list[dict]) -> list[dict]:
         result.append(m)
     
     if truncated_count > 0:
-        logger.info("[tool-truncate] truncated %d tool messages, saved ~%d chars", truncated_count, saved_chars)
+        logger.info("[tool-truncate] truncated %d tool messages, saved ~%d chars (bm25 active=%s)",
+                     truncated_count, saved_chars, bool(relevance_map))
     return result
 
 def _preprocess_messages(messages):
@@ -533,6 +772,42 @@ def _simulate_stream(text, chunk_size=20):
 
 def _estimate_tokens(text): return max(1, len(text) // 2) if text else 0
 
+import tiktoken as _tiktoken
+_tiktoken_enc = _tiktoken.get_encoding("cl100k_base")
+
+def _estimate_tokens_accurate(text: str) -> int:
+    """Count tokens using tiktoken cl100k_base (used by Claude/GPT-4)."""
+    if not text:
+        return 0
+    return len(_tiktoken_enc.encode(text, disallowed_special=()))
+
+def _hard_truncate_prompt(prompt_text: str, max_tokens: int) -> str:
+    """Hard truncate prompt to fit within max_tokens using tiktoken.
+    Keeps the beginning (system prompts) and end (recent messages),
+    cuts from the middle."""
+    tokens = _tiktoken_enc.encode(prompt_text, disallowed_special=())
+    if len(tokens) <= max_tokens:
+        return prompt_text
+    
+    # Reserve a few tokens for the truncation notice
+    usable = max_tokens - 30
+    # Keep first 40% and last 60% (recent context is more important)
+    head_tokens = int(usable * 0.4)
+    tail_tokens = usable - head_tokens
+    
+    head_text = _tiktoken_enc.decode(tokens[:head_tokens])
+    tail_text = _tiktoken_enc.decode(tokens[-tail_tokens:])
+    cut_tokens = len(tokens) - head_tokens - tail_tokens
+    
+    truncated = (
+        head_text +
+        f"\n\n[... 中间 {cut_tokens} tokens 被截断以适应 {max_tokens} token 限制 ...]\n\n" +
+        tail_text
+    )
+    logger.warning("[hard-truncate] %d tokens -> ~%d tokens (cut %d tokens from middle)",
+                   len(tokens), max_tokens, cut_tokens)
+    return truncated
+
 # ── App ──────────────────────────────────────────────────────────────
 
 http_client: httpx.AsyncClient | None = None
@@ -540,7 +815,7 @@ http_client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(_app):
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=5))
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=300, write=10, pool=5))
     key_pool.load()
     yield
     await http_client.aclose()
@@ -605,8 +880,14 @@ def _prepare_prompt(messages, tools, tool_choice):
     return processed, _flatten_messages(processed), has_fc
 
 async def _try_summarize_and_rebuild(messages, tools, tool_choice, force_regenerate=False):
-    """Summarize old messages and rebuild a shorter prompt.
-    If force_regenerate=True, skip cache and regenerate summary.
+    """BM25 extractive compression with position weighting + progressive compression.
+    
+    4-tier system:
+    - Tier 1 (score >= 0.7): Keep verbatim
+    - Tier 2 (score >= 0.4): Light trim (tool results → 1000 chars)
+    - Tier 3 (score >= 0.15): Heavy trim (everything → 200-500 chars)
+    - Tier 4 (score < 0.15): Summarize with DeepSeek
+    
     Returns (new_prompt_text, has_fc) or None if not applicable."""
     system_msgs, old_msgs, recent_msgs = _split_messages_for_summary(messages)
     if not old_msgs:
@@ -614,20 +895,50 @@ async def _try_summarize_and_rebuild(messages, tools, tool_choice, force_regener
         return None
     conv_id = _make_conversation_id(messages)
 
-    if force_regenerate:
-        # Bypass cache, force a new rolling summary
-        logger.info("[summary] force regenerate for conv %s", conv_id[:12])
-        summary = await _summarize_messages_nocache(old_msgs, conv_id)
-    else:
-        cache_key = _make_cache_key(messages)
-        summary = await _summarize_messages(old_msgs, cache_key, conv_id)
+    # Extract latest user query for BM25 relevance
+    query = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            query = _extract_text(m.get("content", ""))
+            break
 
-    if not summary:
-        logger.warning("[summary] failed to generate summary, keeping original messages (no truncation)")
-        return None
-    rebuilt = _rebuild_with_summary(system_msgs, summary, recent_msgs)
-    logger.info("[summary] rebuilt: %d system + summary + %d recent (was %d total)",
-                len(system_msgs), len(recent_msgs), len(messages))
+    # BM25 + position weighting → 4 tiers
+    tier1, tier2, tier3, tier4 = _extract_relevant_rounds(old_msgs, query)
+
+    # Tier 2: light trim
+    tier2_trimmed = _trim_messages(tier2, mode="light") if tier2 else []
+    # Tier 3: heavy trim  
+    tier3_trimmed = _trim_messages(tier3, mode="heavy") if tier3 else []
+
+    # Tier 4: summarize with DeepSeek
+    summary = ""
+    if tier4:
+        if force_regenerate:
+            logger.info("[summary] force regenerate for conv %s (tier4=%d msgs)", conv_id[:12], len(tier4))
+            summary = await _summarize_messages_nocache(tier4, conv_id)
+        else:
+            cache_key = _make_cache_key(messages)
+            summary = await _summarize_messages(tier4, cache_key, conv_id)
+    else:
+        logger.info("[bm25] no tier4 messages, skipping summarization")
+
+    # Rebuild: system + summary + tier3(heavy) + tier2(light) + tier1(verbatim) + recent
+    rebuilt = list(system_msgs)
+    if summary:
+        rebuilt.append({"role": "system", "content": f"[早期对话摘要]\n{summary}"})
+    if tier3_trimmed:
+        rebuilt.append({"role": "system", "content": "[以下为低相关度历史对话，已大幅精简]"})
+        rebuilt.extend(tier3_trimmed)
+    if tier2_trimmed:
+        rebuilt.append({"role": "system", "content": "[以下为中等相关度历史对话，已轻度精简]"})
+        rebuilt.extend(tier2_trimmed)
+    if tier1:
+        rebuilt.append({"role": "system", "content": "[以下为高相关度历史对话，原样保留]"})
+        rebuilt.extend(tier1)
+    rebuilt.extend(recent_msgs)
+
+    logger.info("[summary] rebuilt: %d system + summary(%d) + tier3(%d) + tier2(%d) + tier1(%d) + recent(%d) (was %d total)",
+                len(system_msgs), len(summary), len(tier3_trimmed), len(tier2_trimmed), len(tier1), len(recent_msgs), len(messages))
     _, prompt_text, has_fc = _prepare_prompt(rebuilt, tools, tool_choice)
     return prompt_text, has_fc
 
@@ -651,22 +962,28 @@ async def chat_completions(request: Request):
 
     # Proactive summarization: compress before hitting the LLM if prompt is too long
     summarized = False
-    if len(prompt_text) > PROACTIVE_SUMMARY_THRESHOLD:
-        logger.info("[proactive-summary][%s] prompt_len=%d > threshold=%d, summarizing",
-                     req_id, len(prompt_text), PROACTIVE_SUMMARY_THRESHOLD)
+    est_tokens = _estimate_tokens_accurate(prompt_text)
+    logger.info("[entry][%s] estimated_tokens=%d", req_id, est_tokens)
+    if est_tokens > MAX_PROMPT_TOKENS * 0.8:  # Start summarizing at 80% of hard limit
+        logger.info("[proactive-summary][%s] est_tokens=%d > threshold=%d (80%% of %d), summarizing",
+                     req_id, est_tokens, int(MAX_PROMPT_TOKENS * 0.8), MAX_PROMPT_TOKENS)
         result = await _try_summarize_and_rebuild(messages, tools, tool_choice)
         if result:
             prompt_text, has_fc = result
             summarized = True
-            logger.info("[proactive-summary][%s] compressed to prompt_len=%d", req_id, len(prompt_text))
+            est_tokens = _estimate_tokens_accurate(prompt_text)
+            logger.info("[proactive-summary][%s] compressed to est_tokens=%d", req_id, est_tokens)
             # If still over threshold after using cached summary, force regenerate
-            if len(prompt_text) > PROACTIVE_SUMMARY_THRESHOLD:
+            if est_tokens > MAX_PROMPT_TOKENS * 0.8:
                 logger.info("[proactive-summary][%s] still over threshold (%d), force regenerating summary",
                              req_id, len(prompt_text))
                 result2 = await _try_summarize_and_rebuild(messages, tools, tool_choice, force_regenerate=True)
                 if result2:
                     prompt_text, has_fc = result2
                     logger.info("[proactive-summary][%s] re-compressed to prompt_len=%d", req_id, len(prompt_text))
+
+    # Hard truncation safety net: never exceed MAX_PROMPT_TOKENS
+    prompt_text = _hard_truncate_prompt(prompt_text, MAX_PROMPT_TOKENS)
 
     if stream:
         async def gen_sse():
